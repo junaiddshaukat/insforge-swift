@@ -939,27 +939,31 @@ public actor AuthClient {
         logger.debug("POST \(endpoint.absoluteString)")
         logger.trace("Request headers: \(requestHeaders.filter { $0.key != "Authorization" })")
 
-        let response = try await httpClient.execute(
-            .post,
-            url: endpoint,
-            headers: requestHeaders,
-            body: data
-        )
+        let response: HTTPResponse
+        do {
+            response = try await httpClient.execute(
+                .post,
+                url: endpoint,
+                headers: requestHeaders,
+                body: data
+            )
+        } catch let error as InsForgeError {
+            if case .httpError(let statusCode, _, _, _) = error, statusCode == 401 {
+                logger.error("Refresh token rejected, clearing session state")
+                currentAccessToken = nil
+                try await storage.deleteSession()
+                await onAuthStateChange?(nil)
+                throw InsForgeError.authenticationRequired
+            }
+
+            throw error
+        }
 
         // Log response
         let statusCode = response.response.statusCode
         logger.debug("Response: \(statusCode)")
         if let responseString = String(data: response.data, encoding: .utf8) {
             logger.trace("Response body: \(responseString)")
-        }
-
-        // Check if refresh token is expired (401)
-        if statusCode == 401 {
-            // Clear session and require re-login
-            currentAccessToken = nil
-            try await storage.deleteSession()
-            await onAuthStateChange?(nil)
-            throw InsForgeError.authenticationRequired
         }
 
         let authResponse = try response.decode(AuthResponse.self)
