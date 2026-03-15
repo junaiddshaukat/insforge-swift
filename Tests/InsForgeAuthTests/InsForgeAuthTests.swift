@@ -308,6 +308,25 @@ final class InsForgeAuthTests: XCTestCase {
         XCTAssertEqual(persistedSession?.accessToken, "legacy-access")
     }
 
+    func testHandleAuthCallbackWithCodeAndNoPKCEVerifierThrowsInvalidResponse() async throws {
+        let client = AuthTestSupport.makeClient(storage: InMemoryAuthStorage())
+        let callbackURL = URL(string: "myapp://auth/callback?insforge_code=missing-verifier")!
+
+        do {
+            _ = try await client.handleAuthCallback(callbackURL)
+            XCTFail("Expected invalidResponse when PKCE verifier is unavailable")
+        } catch let error as InsForgeError {
+            switch error {
+            case .invalidResponse:
+                break
+            default:
+                XCTFail("Expected invalidResponse, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected InsForgeError.invalidResponse, got \(error)")
+        }
+    }
+
     func testHandleAuthCallbackWithoutRequiredParametersThrowsInvalidResponse() async throws {
         let client = AuthTestSupport.makeClient(storage: InMemoryAuthStorage())
         let callbackURL = URL(string: "myapp://auth/callback?foo=bar")!
@@ -372,6 +391,36 @@ final class InsForgeAuthTests: XCTestCase {
 
         let persistedSession = try await storage.getSession()
         XCTAssertEqual(persistedSession?.refreshToken, "verified-refresh")
+    }
+
+    func testVerifyEmailWithExplicitEmailIncludesEmailInRequestPayload() async throws {
+        let storage = InMemoryAuthStorage()
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/email/verify"
+        } response: { request in
+            let body = try AuthTestSupport.decodeJSONBody(request)
+            XCTAssertEqual(body["otp"] as? String, "654321")
+            XCTAssertEqual(body["email"] as? String, "verified@example.com")
+
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "verified@example.com",
+                    accessToken: "verified-access-2",
+                    refreshToken: "verified-refresh-2"
+                )
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+        let response = try await client.verifyEmail(email: "verified@example.com", otp: "654321")
+
+        XCTAssertEqual(response.user.email, "verified@example.com")
+
+        let persistedSession = try await storage.getSession()
+        XCTAssertEqual(persistedSession?.accessToken, "verified-access-2")
     }
 
     func testGetProfileDecodesProfilePayload() async throws {
@@ -534,6 +583,35 @@ final class InsForgeAuthTests: XCTestCase {
         XCTAssertEqual(currentToken, "fresh-access-token")
     }
 
+    func testRefreshAccessTokenWithoutRefreshTokenThrowsAuthenticationRequired() async throws {
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: "access-only",
+                refreshToken: nil,
+                email: "norefresh@example.com"
+            )
+        )
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+
+        do {
+            _ = try await client.refreshAccessToken()
+            XCTFail("Expected authenticationRequired when no refresh token is stored")
+        } catch let error as InsForgeError {
+            switch error {
+            case .authenticationRequired:
+                break
+            default:
+                XCTFail("Expected authenticationRequired, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected InsForgeError.authenticationRequired, got \(error)")
+        }
+
+        XCTAssertTrue(MockURLProtocol.recordedRequests.isEmpty)
+    }
+
     func testGetCurrentUserRetriesWithRefreshedTokenAfter401() async throws {
         let storage = InMemoryAuthStorage()
         try await storage.saveSession(
@@ -602,6 +680,92 @@ final class InsForgeAuthTests: XCTestCase {
         XCTAssertEqual(updatedSession?.refreshToken, "fresh-refresh")
     }
 
+    func testGetCurrentUserWithAutoRefreshDisabledPropagates401WithoutRefreshAttempt() async throws {
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: "expired-access",
+                refreshToken: "refresh-token",
+                email: "disabled-refresh@example.com"
+            )
+        )
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/sessions/current"
+        } response: { request in
+            try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 401,
+                json: [
+                    "error": "unauthorized",
+                    "message": "Token expired"
+                ]
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage, autoRefreshToken: false)
+
+        do {
+            _ = try await client.getCurrentUser()
+            XCTFail("Expected the original 401 to be propagated when auto refresh is disabled")
+        } catch let error as InsForgeError {
+            switch error {
+            case .httpError(let statusCode, let message, _, _):
+                XCTAssertEqual(statusCode, 401)
+                XCTAssertEqual(message, "Token expired")
+            default:
+                XCTFail("Expected original 401 error, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected InsForgeError.httpError, got \(error)")
+        }
+
+        XCTAssertEqual(MockURLProtocol.recordedRequests.map { $0.url?.path }, ["/sessions/current"])
+    }
+
+    func testUpdateProfileWithAutoRefreshDisabledPropagates401WithoutRefreshAttempt() async throws {
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: "expired-profile-access",
+                refreshToken: "profile-refresh",
+                email: "profile-disabled@example.com"
+            )
+        )
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/profiles/current"
+        } response: { request in
+            try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 401,
+                json: [
+                    "error": "unauthorized",
+                    "message": "Token expired"
+                ]
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage, autoRefreshToken: false)
+
+        do {
+            _ = try await client.updateProfile(["name": "Should Fail"])
+            XCTFail("Expected the original 401 to be propagated when auto refresh is disabled")
+        } catch let error as InsForgeError {
+            switch error {
+            case .httpError(let statusCode, let message, _, _):
+                XCTAssertEqual(statusCode, 401)
+                XCTAssertEqual(message, "Token expired")
+            default:
+                XCTFail("Expected original 401 error, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected InsForgeError.httpError, got \(error)")
+        }
+
+        XCTAssertEqual(MockURLProtocol.recordedRequests.map { $0.url?.path }, ["/profiles/current"])
+    }
+
     func testRefreshAccessTokenClearsStoredSessionWhenRefreshTokenIsRejected() async throws {
         let storage = InMemoryAuthStorage()
         try await storage.saveSession(
@@ -645,5 +809,30 @@ final class InsForgeAuthTests: XCTestCase {
         let clearedToken = try await client.getAccessToken()
         XCTAssertNil(clearedSession)
         XCTAssertNil(clearedToken)
+    }
+
+    func testSignInWithMalformedSuccessPayloadThrowsDecodingError() async throws {
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/sessions"
+        } response: { request in
+            try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: [
+                    "accessToken": "broken-access"
+                ]
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: InMemoryAuthStorage())
+
+        do {
+            _ = try await client.signIn(email: "broken@example.com", password: "super-secret")
+            XCTFail("Expected malformed payload to surface as a decoding error")
+        } catch is DecodingError {
+            // Expected.
+        } catch {
+            XCTFail("Expected DecodingError, got \(error)")
+        }
     }
 }

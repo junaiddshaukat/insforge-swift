@@ -8,7 +8,10 @@ enum AuthTestSupport {
     private static let authComponentURL = URL(string: "https://example.com/auth")!
     private static let defaultHeaders = ["X-Client-Info": "insforge-swift-tests"]
 
-    static func makeClient(storage: AuthStorage) -> AuthClient {
+    static func makeClient(
+        storage: AuthStorage,
+        autoRefreshToken: Bool = true
+    ) -> AuthClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
         let session = URLSession(configuration: configuration)
@@ -19,7 +22,10 @@ enum AuthTestSupport {
             authComponent: authComponentURL,
             headers: defaultHeaders,
             httpClient: httpClient,
-            options: AuthOptions(storage: storage)
+            options: AuthOptions(
+                autoRefreshToken: autoRefreshToken,
+                storage: storage
+            )
         )
     }
 
