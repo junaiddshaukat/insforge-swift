@@ -106,6 +106,9 @@ public actor AuthClient {
     /// Callback invoked when auth state changes (sign in/up/out)
     private var onAuthStateChange: (@Sendable (Session?) async -> Void)?
 
+    /// Shared in-flight refresh task so concurrent callers reuse the same refresh exchange.
+    private var refreshTask: Task<AuthResponse, Error>?
+
     public init(
         url: URL,
         authComponent: URL,
@@ -916,6 +919,18 @@ public actor AuthClient {
     /// - Throws: `InsForgeError.authenticationRequired` if no refresh token is available
     @discardableResult
     public func refreshAccessToken() async throws -> AuthResponse {
+        if let refreshTask {
+            return try await refreshTask.value
+        }
+
+        let refreshTask = Task { try await performTokenRefresh() }
+        self.refreshTask = refreshTask
+        defer { self.refreshTask = nil }
+
+        return try await refreshTask.value
+    }
+
+    private func performTokenRefresh() async throws -> AuthResponse {
         guard let session = try await storage.getSession(),
               let refreshToken = session.refreshToken else {
             logger.error("No refresh token available")

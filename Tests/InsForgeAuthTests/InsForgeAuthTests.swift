@@ -609,7 +609,7 @@ final class InsForgeAuthTests: XCTestCase {
             XCTFail("Expected InsForgeError.authenticationRequired, got \(error)")
         }
 
-        XCTAssertTrue(MockURLProtocol.recordedRequests.isEmpty)
+        XCTAssertTrue(MockURLProtocol.snapshotRecordedRequests().isEmpty)
     }
 
     func testGetCurrentUserRetriesWithRefreshedTokenAfter401() async throws {
@@ -645,11 +645,11 @@ final class InsForgeAuthTests: XCTestCase {
             return try AuthTestSupport.makeHTTPResponse(
                 url: request.url!,
                 statusCode: 200,
-                json: [
-                    "accessToken": "fresh-access",
-                    "refreshToken": "fresh-refresh",
-                    "user": AuthTestSupport.makeUserJSON(email: "after-refresh@example.com")
-                ]
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "after-refresh@example.com",
+                    accessToken: "fresh-access",
+                    refreshToken: "fresh-refresh"
+                )
             )
         }
 
@@ -671,9 +671,282 @@ final class InsForgeAuthTests: XCTestCase {
 
         XCTAssertEqual(user.email, "after-refresh@example.com")
 
-        let requests = MockURLProtocol.recordedRequests
+        let requests = MockURLProtocol.snapshotRecordedRequests()
         XCTAssertEqual(requests.map { $0.url?.path }, ["/sessions/current", "/refresh", "/sessions/current"])
         XCTAssertEqual(requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer fresh-access")
+
+        let updatedSession = try await storage.getSession()
+        XCTAssertEqual(updatedSession?.accessToken, "fresh-access")
+        XCTAssertEqual(updatedSession?.refreshToken, "fresh-refresh")
+    }
+
+    func testGetCurrentUserProactivelyRefreshesExpiredJWTAccessTokenBeforeRequest() async throws {
+        let expiredAccessToken = try AuthTestSupport.makeJWTAccessToken(
+            email: "before-refresh@example.com",
+            issuedAt: Date(timeIntervalSince1970: 1_763_000_000),
+            expiresAt: Date(timeIntervalSinceNow: -3_600)
+        )
+
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: expiredAccessToken,
+                refreshToken: "refresh-token",
+                email: "before-refresh@example.com"
+            )
+        )
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/sessions/current"
+                && request.value(forHTTPHeaderField: "Authorization") == "Bearer \(expiredAccessToken)"
+        } response: { request in
+            XCTFail("Expired JWT access token should be refreshed proactively before requesting /sessions/current")
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 401,
+                json: [
+                    "error": "unauthorized",
+                    "message": "Token expired"
+                ]
+            )
+        }
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/refresh"
+        } response: { request in
+            let body = try AuthTestSupport.decodeJSONBody(request)
+            XCTAssertEqual(body["refresh_token"] as? String, "refresh-token")
+
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "after-refresh@example.com",
+                    accessToken: "fresh-access",
+                    refreshToken: "fresh-refresh"
+                )
+            )
+        }
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/sessions/current"
+                && request.value(forHTTPHeaderField: "Authorization") == "Bearer fresh-access"
+        } response: { request in
+            try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: [
+                    "user": AuthTestSupport.makeUserJSON(email: "after-refresh@example.com")
+                ]
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+        let user = try await client.getCurrentUser()
+
+        XCTAssertEqual(user.email, "after-refresh@example.com")
+
+        let requests = MockURLProtocol.snapshotRecordedRequests()
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/refresh", "/sessions/current"])
+        XCTAssertEqual(requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer fresh-access")
+
+        let updatedSession = try await storage.getSession()
+        XCTAssertEqual(updatedSession?.accessToken, "fresh-access")
+        XCTAssertEqual(updatedSession?.refreshToken, "fresh-refresh")
+    }
+
+    func testGetCurrentUserWithValidJWTAccessTokenSkipsProactiveRefresh() async throws {
+        let validAccessToken = try AuthTestSupport.makeJWTAccessToken(
+            email: "still-valid@example.com",
+            issuedAt: Date(timeIntervalSinceNow: -300),
+            expiresAt: Date(timeIntervalSinceNow: 3_600)
+        )
+
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: validAccessToken,
+                refreshToken: "refresh-token",
+                email: "still-valid@example.com"
+            )
+        )
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/sessions/current"
+                && request.value(forHTTPHeaderField: "Authorization") == "Bearer \(validAccessToken)"
+        } response: { request in
+            try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: [
+                    "user": AuthTestSupport.makeUserJSON(email: "still-valid@example.com")
+                ]
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+        let user = try await client.getCurrentUser()
+
+        XCTAssertEqual(user.email, "still-valid@example.com")
+        XCTAssertEqual(MockURLProtocol.snapshotRecordedRequests().map { $0.url?.path }, ["/sessions/current"])
+    }
+
+    func testConcurrentRefreshAccessTokenCallsShareSingleInFlightRefresh() async throws {
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: "stale-access",
+                refreshToken: "stable-refresh-token",
+                email: "refresh-race@example.com"
+            )
+        )
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/refresh"
+        } response: { request in
+            let body = try AuthTestSupport.decodeJSONBody(request)
+            XCTAssertEqual(body["refresh_token"] as? String, "stable-refresh-token")
+
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "refresh-race@example.com",
+                    accessToken: "shared-fresh-access",
+                    refreshToken: "shared-fresh-refresh"
+                )
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+        let callersReady = ConcurrentRequestBarrier(parties: 2)
+
+        let firstTask = Task {
+            XCTAssertTrue(callersReady.wait(), "Timed out waiting for the first concurrent refresh caller")
+            return try await client.refreshAccessToken()
+        }
+
+        let secondTask = Task {
+            XCTAssertTrue(callersReady.wait(), "Timed out waiting for the second concurrent refresh caller")
+            return try await client.refreshAccessToken()
+        }
+
+        let firstResponse = try await firstTask.value
+        let secondResponse = try await secondTask.value
+
+        XCTAssertEqual(firstResponse.accessToken, "shared-fresh-access")
+        XCTAssertEqual(secondResponse.accessToken, "shared-fresh-access")
+        XCTAssertEqual(firstResponse.refreshToken, "shared-fresh-refresh")
+        XCTAssertEqual(secondResponse.refreshToken, "shared-fresh-refresh")
+
+        let updatedSession = try await storage.getSession()
+        XCTAssertEqual(updatedSession?.accessToken, "shared-fresh-access")
+        XCTAssertEqual(updatedSession?.refreshToken, "shared-fresh-refresh")
+
+        let requests = MockURLProtocol.snapshotRecordedRequests()
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/refresh"])
+    }
+
+    func testConcurrentGetCurrentUserRequestsShareRefreshAfter401() async throws {
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: "expired-access",
+                refreshToken: "refresh-token",
+                email: "before-refresh@example.com"
+            )
+        )
+
+        let expiredResponseBarrier = ConcurrentRequestBarrier(parties: 2)
+
+        for _ in 0..<2 {
+            MockURLProtocol.enqueueStub { request in
+                request.url?.path == "/sessions/current"
+                    && request.value(forHTTPHeaderField: "Authorization") == "Bearer expired-access"
+            } response: { request in
+                XCTAssertTrue(
+                    expiredResponseBarrier.wait(),
+                    "Timed out waiting for both expired-token requests before responding with 401"
+                )
+
+                return try AuthTestSupport.makeHTTPResponse(
+                    url: request.url!,
+                    statusCode: 401,
+                    json: [
+                        "error": "unauthorized",
+                        "message": "Token expired"
+                    ]
+                )
+            }
+        }
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/refresh"
+        } response: { request in
+            let body = try AuthTestSupport.decodeJSONBody(request)
+            XCTAssertEqual(body["refresh_token"] as? String, "refresh-token")
+
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "after-refresh@example.com",
+                    accessToken: "fresh-access",
+                    refreshToken: "fresh-refresh"
+                )
+            )
+        }
+
+        for _ in 0..<2 {
+            MockURLProtocol.enqueueStub { request in
+                request.url?.path == "/sessions/current"
+                    && request.value(forHTTPHeaderField: "Authorization") == "Bearer fresh-access"
+            } response: { request in
+                try AuthTestSupport.makeHTTPResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    json: [
+                        "user": AuthTestSupport.makeUserJSON(email: "after-refresh@example.com")
+                    ]
+                )
+            }
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+        let callersReady = ConcurrentRequestBarrier(parties: 2)
+
+        let firstTask = Task {
+            XCTAssertTrue(callersReady.wait(), "Timed out waiting for the first concurrent getCurrentUser caller")
+            return try await client.getCurrentUser()
+        }
+
+        let secondTask = Task {
+            XCTAssertTrue(callersReady.wait(), "Timed out waiting for the second concurrent getCurrentUser caller")
+            return try await client.getCurrentUser()
+        }
+
+        let firstUser = try await firstTask.value
+        let secondUser = try await secondTask.value
+
+        XCTAssertEqual(firstUser.email, "after-refresh@example.com")
+        XCTAssertEqual(secondUser.email, "after-refresh@example.com")
+
+        let requests = MockURLProtocol.snapshotRecordedRequests()
+        XCTAssertEqual(requests.filter { $0.url?.path == "/refresh" }.count, 1)
+        XCTAssertEqual(
+            requests.filter {
+                $0.url?.path == "/sessions/current"
+                    && $0.value(forHTTPHeaderField: "Authorization") == "Bearer expired-access"
+            }.count,
+            2
+        )
+        XCTAssertEqual(
+            requests.filter {
+                $0.url?.path == "/sessions/current"
+                    && $0.value(forHTTPHeaderField: "Authorization") == "Bearer fresh-access"
+            }.count,
+            2
+        )
 
         let updatedSession = try await storage.getSession()
         XCTAssertEqual(updatedSession?.accessToken, "fresh-access")
@@ -720,7 +993,7 @@ final class InsForgeAuthTests: XCTestCase {
             XCTFail("Expected InsForgeError.httpError, got \(error)")
         }
 
-        XCTAssertEqual(MockURLProtocol.recordedRequests.map { $0.url?.path }, ["/sessions/current"])
+        XCTAssertEqual(MockURLProtocol.snapshotRecordedRequests().map { $0.url?.path }, ["/sessions/current"])
     }
 
     func testUpdateProfileWithAutoRefreshDisabledPropagates401WithoutRefreshAttempt() async throws {
@@ -763,7 +1036,7 @@ final class InsForgeAuthTests: XCTestCase {
             XCTFail("Expected InsForgeError.httpError, got \(error)")
         }
 
-        XCTAssertEqual(MockURLProtocol.recordedRequests.map { $0.url?.path }, ["/profiles/current"])
+        XCTAssertEqual(MockURLProtocol.snapshotRecordedRequests().map { $0.url?.path }, ["/profiles/current"])
     }
 
     func testRefreshAccessTokenClearsStoredSessionWhenRefreshTokenIsRejected() async throws {

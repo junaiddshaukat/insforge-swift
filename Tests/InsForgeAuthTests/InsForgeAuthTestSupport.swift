@@ -86,6 +86,32 @@ enum AuthTestSupport {
         return json
     }
 
+    static func makeJWTAccessToken(
+        subject: String = UUID().uuidString,
+        email: String = "jwt@example.com",
+        issuedAt: Date = Date(),
+        expiresAt: Date
+    ) throws -> String {
+        let header = try JSONSerialization.data(withJSONObject: [
+            "alg": "HS256",
+            "typ": "JWT"
+        ])
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "sub": subject,
+            "email": email,
+            "role": "authenticated",
+            "iat": Int(issuedAt.timeIntervalSince1970),
+            "exp": Int(expiresAt.timeIntervalSince1970)
+        ])
+
+        let signature = Data("test-signature".utf8)
+        return [
+            header.base64URLEncodedString(),
+            payload.base64URLEncodedString(),
+            signature.base64URLEncodedString()
+        ].joined(separator: ".")
+    }
+
     static func makeHTTPResponse(
         url: URL,
         statusCode: Int,
@@ -136,6 +162,15 @@ enum AuthTestSupport {
     }
 }
 
+private extension Data {
+    func base64URLEncodedString() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
 actor AuthStateRecorder {
     private var events = [Session?]()
 
@@ -145,6 +180,37 @@ actor AuthStateRecorder {
 
     func snapshot() -> [Session?] {
         events
+    }
+}
+
+final class ConcurrentRequestBarrier: @unchecked Sendable {
+    private let parties: Int
+    private let condition = NSCondition()
+    private var arrivals = 0
+
+    init(parties: Int) {
+        self.parties = parties
+    }
+
+    @discardableResult
+    func wait(timeout: TimeInterval = 5.0) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+
+        arrivals += 1
+        if arrivals >= parties {
+            condition.broadcast()
+            return true
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while arrivals < parties {
+            if !condition.wait(until: deadline) {
+                return false
+            }
+        }
+
+        return true
     }
 }
 
@@ -210,5 +276,11 @@ final class MockURLProtocol: URLProtocol {
         stubs.removeAll()
         recordedRequests.removeAll()
         lock.unlock()
+    }
+
+    static func snapshotRecordedRequests() -> [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedRequests
     }
 }
