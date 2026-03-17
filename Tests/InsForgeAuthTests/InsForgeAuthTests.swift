@@ -847,6 +847,94 @@ final class InsForgeAuthTests: XCTestCase {
         XCTAssertEqual(requests.map { $0.url?.path }, ["/refresh"])
     }
 
+    func testRefreshAccessTokenCancellationDoesNotClearSharedInFlightRefreshTask() async throws {
+        let storage = InMemoryAuthStorage()
+        try await storage.saveSession(
+            AuthTestSupport.makeSession(
+                accessToken: "stale-access",
+                refreshToken: "rotating-refresh-token",
+                email: "refresh-race@example.com"
+            )
+        )
+
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let allowRefreshResponse = DispatchSemaphore(value: 0)
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/refresh"
+        } response: { request in
+            refreshStarted.signal()
+            XCTAssertEqual(
+                allowRefreshResponse.wait(timeout: .now() + 1),
+                .success,
+                "Timed out waiting to finish the in-flight refresh request"
+            )
+
+            let body = try AuthTestSupport.decodeJSONBody(request)
+            XCTAssertEqual(body["refresh_token"] as? String, "rotating-refresh-token")
+
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "refresh-race@example.com",
+                    accessToken: "shared-fresh-access",
+                    refreshToken: "rotated-refresh-token"
+                )
+            )
+        }
+
+        MockURLProtocol.enqueueStub { request in
+            request.url?.path == "/refresh"
+        } response: { request in
+            XCTFail("Cancellation of the first waiter should not allow a second /refresh request to start")
+
+            return try AuthTestSupport.makeHTTPResponse(
+                url: request.url!,
+                statusCode: 200,
+                json: AuthTestSupport.makeAuthResponseJSON(
+                    email: "refresh-race@example.com",
+                    accessToken: "unexpected-access",
+                    refreshToken: "unexpected-refresh"
+                )
+            )
+        }
+
+        let client = AuthTestSupport.makeClient(storage: storage)
+
+        let firstTask = Task {
+            try await client.refreshAccessToken()
+        }
+
+        XCTAssertEqual(
+            refreshStarted.wait(timeout: .now() + 1),
+            .success,
+            "Timed out waiting for the first refresh request to start"
+        )
+
+        firstTask.cancel()
+        await Task.yield()
+
+        let secondTask = Task {
+            try await client.refreshAccessToken()
+        }
+
+        allowRefreshResponse.signal()
+
+        let secondResponse = try await secondTask.value
+        _ = await firstTask.result
+
+        XCTAssertEqual(secondResponse.accessToken, "shared-fresh-access")
+        XCTAssertEqual(secondResponse.refreshToken, "rotated-refresh-token")
+
+        let updatedSession = try await storage.getSession()
+        XCTAssertEqual(updatedSession?.accessToken, "shared-fresh-access")
+        XCTAssertEqual(updatedSession?.refreshToken, "rotated-refresh-token")
+
+        let requests = MockURLProtocol.snapshotRecordedRequests()
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/refresh"])
+    }
+
     func testConcurrentGetCurrentUserRequestsShareRefreshAfter401() async throws {
         let storage = InMemoryAuthStorage()
         try await storage.saveSession(

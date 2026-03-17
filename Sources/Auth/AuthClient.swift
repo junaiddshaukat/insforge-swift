@@ -106,8 +106,13 @@ public actor AuthClient {
     /// Callback invoked when auth state changes (sign in/up/out)
     private var onAuthStateChange: (@Sendable (Session?) async -> Void)?
 
+    private struct RefreshTaskState {
+        let id: UUID
+        let task: Task<AuthResponse, Error>
+    }
+
     /// Shared in-flight refresh task so concurrent callers reuse the same refresh exchange.
-    private var refreshTask: Task<AuthResponse, Error>?
+    private var refreshTask: RefreshTaskState?
 
     public init(
         url: URL,
@@ -920,14 +925,32 @@ public actor AuthClient {
     @discardableResult
     public func refreshAccessToken() async throws -> AuthResponse {
         if let refreshTask {
-            return try await refreshTask.value
+            return try await refreshTask.task.value
         }
 
-        let refreshTask = Task { try await performTokenRefresh() }
-        self.refreshTask = refreshTask
-        defer { self.refreshTask = nil }
+        let refreshTaskID = UUID()
+        let refreshTask = Task<AuthResponse, Error> { [self] in
+            do {
+                let response = try await performTokenRefresh()
+                clearRefreshTask(id: refreshTaskID)
+                return response
+            } catch {
+                clearRefreshTask(id: refreshTaskID)
+                throw error
+            }
+        }
+
+        self.refreshTask = RefreshTaskState(id: refreshTaskID, task: refreshTask)
 
         return try await refreshTask.value
+    }
+
+    private func clearRefreshTask(id: UUID) {
+        guard refreshTask?.id == id else {
+            return
+        }
+
+        refreshTask = nil
     }
 
     private func performTokenRefresh() async throws -> AuthResponse {
