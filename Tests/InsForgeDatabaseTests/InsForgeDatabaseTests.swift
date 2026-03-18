@@ -125,6 +125,98 @@ final class InsForgeDatabaseTests: XCTestCase {
         XCTAssertNotNil(page3)
     }
 
+    func testQueryBuilderAdvancedOperators() async {
+        let client = TestHelper.createClient()
+        let builder = await client.database.from("posts")
+
+        let filtered = builder
+            .select("id, title, content")
+            .or("published.eq.true", "views.gt.100")
+            .and("category.eq.swift", "featured.eq.true")
+            .not("status", operator: "eq", value: "archived")
+            .contains("tags", values: ["swift", "ios"])
+            .containedBy("audiences", values: ["swift", "ios", "backend"])
+            .textSearch("content", query: "swift sdk", config: "english", type: .websearch)
+            .filter("priority", operator: "lt", value: 10)
+        XCTAssertNotNil(filtered)
+    }
+
+    func testQueryBuilderAdvancedOperatorArrayOverloads() async {
+        let client = TestHelper.createClient()
+        let builder = await client.database.from("posts")
+
+        let filtered = builder
+            .or(["published.eq.true", "views.gt.100"])
+            .and(["category.eq.swift", "featured.eq.true"])
+            .textSearch("content", query: "swift sdk")
+
+        XCTAssertNotNil(filtered)
+    }
+
+    func testUpsertRejectsUnsupportedQueryModifiers() async {
+        let client = TestHelper.createClient()
+        let builder = await client.database.from("posts")
+        let post = Post(
+            id: "post-123",
+            title: "Test Post",
+            content: "Test content",
+            published: true,
+            views: 42,
+            createdAt: nil
+        )
+
+        do {
+            let _: [Post] = try await builder
+                .eq("id", value: "post-123")
+                .order("created_at")
+                .upsert([post], onConflict: "id")
+            XCTFail("Expected upsert() to reject unsupported query modifiers")
+        } catch let error as InsForgeError {
+            guard case .validationError(let message) = error else {
+                XCTFail("Expected validationError, got \(error)")
+                return
+            }
+
+            XCTAssertTrue(message.contains("upsert()"))
+            XCTAssertTrue(message.contains("id"))
+            XCTAssertTrue(message.contains("order"))
+        } catch {
+            XCTFail("Expected InsForgeError.validationError, got \(error)")
+        }
+    }
+
+    func testInsertRejectsUnsupportedQueryModifiers() async {
+        let client = TestHelper.createClient()
+        let builder = await client.database.from("posts")
+        let post = Post(
+            id: "post-123",
+            title: "Test Post",
+            content: "Test content",
+            published: true,
+            views: 42,
+            createdAt: nil
+        )
+
+        do {
+            let _: [Post] = try await builder
+                .eq("id", value: "post-123")
+                .order("created_at")
+                .insert([post])
+            XCTFail("Expected insert() to reject unsupported query modifiers")
+        } catch let error as InsForgeError {
+            guard case .validationError(let message) = error else {
+                XCTFail("Expected validationError, got \(error)")
+                return
+            }
+
+            XCTAssertTrue(message.contains("insert()"))
+            XCTAssertTrue(message.contains("id"))
+            XCTAssertTrue(message.contains("order"))
+        } catch {
+            XCTFail("Expected InsForgeError.validationError, got \(error)")
+        }
+    }
+
     // MARK: - Model Encoding Tests
 
     func testPostModelEncoding() throws {
@@ -383,6 +475,13 @@ final class InsForgeDatabaseTests: XCTestCase {
         XCTAssertEqual(CountOption.estimated.rawValue, "estimated")
     }
 
+    func testTextSearchTypeRawValues() {
+        XCTAssertEqual(TextSearchType.fullText.rawValue, "fts")
+        XCTAssertEqual(TextSearchType.plain.rawValue, "plfts")
+        XCTAssertEqual(TextSearchType.phrase.rawValue, "phfts")
+        XCTAssertEqual(TextSearchType.websearch.rawValue, "wfts")
+    }
+
     func testQueryResultStructure() {
         // Test QueryResult with data and count
         let posts = [
@@ -501,4 +600,5 @@ final class InsForgeDatabaseTests: XCTestCase {
         XCTAssertEqual(postResult.data.count, 1)
         XCTAssertEqual(postResult.count, 1)
     }
+
 }
