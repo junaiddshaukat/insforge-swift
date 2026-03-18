@@ -168,7 +168,6 @@ public struct QueryBuilder: Sendable {
     private let decoder: JSONDecoder
     private let tokenRefreshHandler: (any TokenRefreshHandler)?
     private var queryItems: [URLQueryItem] = []
-    private var preferHeader: String?
     private var countOption: CountOption?
     private var head: Bool = false
 
@@ -226,6 +225,38 @@ public struct QueryBuilder: Sendable {
 
     private func postgresArrayLiteral(from values: [Any]) -> String {
         "{\(values.map { "\($0)" }.joined(separator: ","))}"
+    }
+
+    private func buildMutationURL(
+        operation: String,
+        appending extraQueryItems: [URLQueryItem] = []
+    ) throws -> URL {
+        let unsupportedQueryItemNames = Set(
+            queryItems
+                .map(\.name)
+                .filter { $0 != "select" && $0 != "columns" }
+        )
+
+        if !unsupportedQueryItemNames.isEmpty {
+            let joinedNames = unsupportedQueryItemNames.sorted().joined(separator: ", ")
+            throw InsForgeError.validationError(
+                "\(operation)() does not support chained query modifiers on POST requests. " +
+                "Remove these query parameters before calling \(operation)(): \(joinedNames)"
+            )
+        }
+
+        let mutationQueryItems = queryItems.filter { item in
+            item.name == "select" || item.name == "columns"
+        } + extraQueryItems
+
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = mutationQueryItems
+
+        guard let requestURL = components?.url else {
+            throw InsForgeError.invalidURL
+        }
+
+        return requestURL
     }
 
     // MARK: - Query Modifiers
@@ -604,7 +635,7 @@ public struct QueryBuilder: Sendable {
         logger.trace("Request headers: \(requestHeaders.filter { $0.key != "Authorization" })")
 
         do {
-            let response = try await builder.executeRequest(
+            let response = try await executeRequest(
                 .get,
                 url: requestURL,
                 headers: requestHeaders
@@ -634,39 +665,33 @@ public struct QueryBuilder: Sendable {
     /// - Returns: The inserted records with server-generated fields populated.
     /// - Throws: `InsForgeError` if the insert fails.
     public func insert<T: Encodable>(_ values: [T]) async throws -> [T] where T: Decodable {
-        var builder = self
-        builder.preferHeader = "return=representation"
+        let requestURL = try buildMutationURL(operation: "insert")
+        let data = try encoder.encode(values)
 
-        let data = try builder.encoder.encode(values)
-
-        var requestHeaders = builder.headers
+        var requestHeaders = headers
         requestHeaders["Content-Type"] = "application/json"
-        if let prefer = builder.preferHeader {
-            requestHeaders["Prefer"] = prefer
-        }
+        requestHeaders["Prefer"] = "return=representation"
 
-        // Log request
-        logger.debug("POST \(builder.url.absoluteString)")
+        logger.debug("POST \(requestURL.absoluteString)")
         logger.trace("Request headers: \(requestHeaders.filter { $0.key != "Authorization" })")
         if let bodyString = String(data: data, encoding: .utf8) {
             logger.trace("Request body: \(bodyString)")
         }
 
-        let response = try await builder.executeRequest(
+        let response = try await executeRequest(
             .post,
-            url: builder.url,
+            url: requestURL,
             headers: requestHeaders,
             body: data
         )
 
-        // Log response
         let statusCode = response.response.statusCode
         logger.debug("Response: \(statusCode)")
         if let responseString = String(data: response.data, encoding: .utf8) {
             logger.trace("Response body: \(responseString)")
         }
 
-        let result = try builder.decoder.decode([T].self, from: response.data)
+        let result = try decoder.decode([T].self, from: response.data)
         logger.debug("Inserted \(result.count) record(s)")
         return result
     }
@@ -696,7 +721,10 @@ public struct QueryBuilder: Sendable {
         ignoreDuplicates: Bool = false
     ) async throws -> [T] where T: Decodable {
         let extraQueryItems = onConflict.map { [URLQueryItem(name: "on_conflict", value: $0)] } ?? []
-        let requestURL = try buildURL(appending: extraQueryItems)
+        let requestURL = try buildMutationURL(
+            operation: "upsert",
+            appending: extraQueryItems
+        )
         let data = try encoder.encode(values)
 
         var requestHeaders = headers
@@ -734,6 +762,7 @@ public struct QueryBuilder: Sendable {
     ///   - onConflict: Optional comma-separated conflict target columns.
     ///   - ignoreDuplicates: If `true`, conflicting rows are ignored instead of merged.
     /// - Returns: The inserted or updated record with server-generated fields populated.
+    ///   When `ignoreDuplicates` is `true`, a skipped duplicate returns the original input value.
     /// - Throws: `InsForgeError` if the upsert fails.
     public func upsert<T: Encodable>(
         _ value: T,
@@ -746,6 +775,10 @@ public struct QueryBuilder: Sendable {
             ignoreDuplicates: ignoreDuplicates
         )
         guard let first = results.first else {
+            if ignoreDuplicates {
+                return value
+            }
+
             throw InsForgeError.unknown("Upsert failed")
         }
         return first

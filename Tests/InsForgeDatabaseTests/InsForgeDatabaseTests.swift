@@ -153,6 +153,70 @@ final class InsForgeDatabaseTests: XCTestCase {
         XCTAssertNotNil(filtered)
     }
 
+    func testUpsertRejectsUnsupportedQueryModifiers() async {
+        let client = TestHelper.createClient()
+        let builder = await client.database.from("posts")
+        let post = Post(
+            id: "post-123",
+            title: "Test Post",
+            content: "Test content",
+            published: true,
+            views: 42,
+            createdAt: nil
+        )
+
+        do {
+            let _: [Post] = try await builder
+                .eq("id", value: "post-123")
+                .order("created_at")
+                .upsert([post], onConflict: "id")
+            XCTFail("Expected upsert() to reject unsupported query modifiers")
+        } catch let error as InsForgeError {
+            guard case .validationError(let message) = error else {
+                XCTFail("Expected validationError, got \(error)")
+                return
+            }
+
+            XCTAssertTrue(message.contains("upsert()"))
+            XCTAssertTrue(message.contains("id"))
+            XCTAssertTrue(message.contains("order"))
+        } catch {
+            XCTFail("Expected InsForgeError.validationError, got \(error)")
+        }
+    }
+
+    func testInsertRejectsUnsupportedQueryModifiers() async {
+        let client = TestHelper.createClient()
+        let builder = await client.database.from("posts")
+        let post = Post(
+            id: "post-123",
+            title: "Test Post",
+            content: "Test content",
+            published: true,
+            views: 42,
+            createdAt: nil
+        )
+
+        do {
+            let _: [Post] = try await builder
+                .eq("id", value: "post-123")
+                .order("created_at")
+                .insert([post])
+            XCTFail("Expected insert() to reject unsupported query modifiers")
+        } catch let error as InsForgeError {
+            guard case .validationError(let message) = error else {
+                XCTFail("Expected validationError, got \(error)")
+                return
+            }
+
+            XCTAssertTrue(message.contains("insert()"))
+            XCTAssertTrue(message.contains("id"))
+            XCTAssertTrue(message.contains("order"))
+        } catch {
+            XCTFail("Expected InsForgeError.validationError, got \(error)")
+        }
+    }
+
     // MARK: - Model Encoding Tests
 
     func testPostModelEncoding() throws {
